@@ -48,10 +48,13 @@ def load_processor(cfg: DictDefault, tokenizer: PreTrainedTokenizerBase):
             tokenizer=tokenizer,
         )
 
+    revision = cfg.revision_of_model or "main"
+
     processor = processor_cls.from_pretrained(
         cfg.processor_config,
         trust_remote_code=cfg.trust_remote_code or False,
         tokenizer=tokenizer,
+        revision=revision,
     )
 
     # Attempt to load image size from processor if available
