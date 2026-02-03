@@ -38,8 +38,12 @@ def load_processor(cfg: DictDefault, tokenizer: PreTrainedTokenizerBase):
         from transformers import VoxtralProcessor
 
         if processor_cls == VoxtralProcessor:
+            kwargs = {}
+            if cfg.revision_of_model:
+                kwargs["revision"] = cfg.revision_of_model
             return VoxtralProcessor.from_pretrained(
                 cfg.processor_config,
+                **kwargs,
             )
 
         from axolotl.utils.mistral import Mistral3Processor
@@ -48,13 +52,16 @@ def load_processor(cfg: DictDefault, tokenizer: PreTrainedTokenizerBase):
             tokenizer=tokenizer,
         )
 
-    revision = cfg.revision_of_model or "main"
+    processor_kwargs = {
+        "trust_remote_code": cfg.trust_remote_code or False,
+        "tokenizer": tokenizer,
+    }
+    if cfg.revision_of_model:
+        processor_kwargs["revision"] = cfg.revision_of_model
 
     processor = processor_cls.from_pretrained(
         cfg.processor_config,
-        trust_remote_code=cfg.trust_remote_code or False,
-        tokenizer=tokenizer,
-        revision=revision,
+        **processor_kwargs,
     )
 
     # Attempt to load image size from processor if available
