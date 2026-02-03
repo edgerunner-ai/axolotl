@@ -24,156 +24,95 @@ def encode_streaming(
     text_column: str = "text",
     concatenate: bool = True,
 ) -> Dict[str, List]:
-    res = tokenizer(
+    """
+    Encode streaming examples with auto-chunking support.
+
+    This function tokenizes text without truncation, then automatically splits
+    long sequences into max_tokens-sized chunks. This ensures no data is lost
+    from long sequences.
+
+    Args:
+        examples: Dictionary containing text samples
+        tokenizer: The tokenizer to use
+        max_tokens: Maximum sequence length for each chunk
+        text_column: Name of the text column in examples
+        concatenate: If True, concatenate all samples before chunking
+
+    Returns:
+        Dictionary with input_ids, labels, and attention_mask lists
+    """
+    # Tokenize without truncation to preserve all data
+    full_inputs = tokenizer(
         examples[text_column],
-        truncation=True,
-        max_length=max_tokens - 2,
         add_special_tokens=True,
     )
-    # Convert to PyTorch tensors
-    input_ids = [torch.tensor(seq) for seq in res["input_ids"]]
-    targets = [torch.tensor(seq) for seq in res["input_ids"]]
-    attention_mask = [torch.tensor(seq) for seq in res["attention_mask"]]
-    if not concatenate:
-        return {
-            "input_ids": [seq.tolist() for seq in input_ids],
-            "labels": [seq.tolist() for seq in targets],
-            "attention_mask": [seq.tolist() for seq in attention_mask],
-        }
 
-    new_input_ids = []
-    new_labels = []
-    new_attention_mask = []
-    # Append EOS and PAD tokens to input_ids, and correct attention_mask
-    for i, _ in enumerate(input_ids):
-        input_ids[i] = torch.cat(
-            (
-                input_ids[i],
-                torch.tensor([tokenizer.eos_token_id, tokenizer.pad_token_id]),
-            ),
-            dim=0,
+    # Convert input_ids and attention_mask to tensors
+    full_inputs["input_ids"] = [
+        torch.tensor(sample, dtype=torch.long) for sample in full_inputs["input_ids"]
+    ]
+    full_inputs["attention_mask"] = [
+        torch.tensor(sample, dtype=torch.long)
+        for sample in full_inputs["attention_mask"]
+    ]
+
+    # Resolve a safe pad token id for chunk padding
+    pad_id = (
+        tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else (tokenizer.eos_token_id or 0)
+    )
+
+    if tokenizer.pad_token_id is None:
+        LOG.warning(
+            "tokenizer.pad_token_id is None; falling back to %s for padding", pad_id
         )
-        targets[i] = torch.cat(
-            (
-                targets[i],
-                torch.tensor([tokenizer.eos_token_id, -100]),
-            ),
-            dim=0,
-        )
-        attention_mask[i] = torch.cat((attention_mask[i], torch.tensor([1, 0])), dim=0)
 
-    # Concatenate tokens so that their lengths are less than max_tokens
-    buffer_input_ids = torch.tensor([], dtype=torch.long)
-    buffer_labels = torch.tensor([], dtype=torch.long)
-    buffer_attention_mask = torch.tensor([], dtype=torch.long)
+    inputs_ids, target_ids, attention_mask = [], [], []
 
-    for ids, labels, mask in zip(input_ids, targets, attention_mask, strict=False):
-        if buffer_input_ids.numel() == max_tokens:
-            new_input_ids.append(buffer_input_ids)
-            new_labels.append(buffer_labels)
-            new_attention_mask.append(buffer_attention_mask)
-            buffer_input_ids = torch.tensor([], dtype=torch.long)
-            buffer_labels = torch.tensor([], dtype=torch.long)
-            buffer_attention_mask = torch.tensor([], dtype=torch.long)
-            buffer_input_ids = torch.cat((buffer_input_ids, ids), dim=0)
-            buffer_labels = torch.cat((buffer_labels, labels), dim=0)
-            buffer_attention_mask = torch.cat((buffer_attention_mask, mask), dim=0)
-        elif buffer_input_ids.numel() + ids.numel() <= max_tokens:
-            buffer_input_ids = torch.cat((buffer_input_ids, ids), dim=0)
-            buffer_labels = torch.cat((buffer_labels, labels), dim=0)
-            buffer_attention_mask = torch.cat((buffer_attention_mask, mask), dim=0)
-        else:
-            buffer_input_ids = torch.cat(
-                (
-                    buffer_input_ids,
-                    torch.full(
-                        (max_tokens - buffer_input_ids.numel(),),
-                        tokenizer.pad_token_id,
-                        dtype=torch.long,
-                    ),
-                ),
-                dim=0,
-            )
-            buffer_labels = torch.cat(
-                (
-                    buffer_labels,
-                    torch.full(
-                        (max_tokens - buffer_labels.numel(),),
-                        -100,
-                        dtype=torch.long,
-                    ),
-                ),
-                dim=0,
-            )
-            buffer_attention_mask = torch.cat(
-                (
-                    buffer_attention_mask,
-                    torch.full(
-                        (max_tokens - buffer_attention_mask.numel(),),
-                        0,
-                        dtype=torch.long,
-                    ),
-                ),
-                dim=0,
-            )
-            new_input_ids.append(buffer_input_ids)
-            new_labels.append(buffer_labels)
-            new_attention_mask.append(buffer_attention_mask)
-            buffer_input_ids = torch.tensor([], dtype=torch.long)
-            buffer_labels = torch.tensor([], dtype=torch.long)
-            buffer_attention_mask = torch.tensor([], dtype=torch.long)
+    # Concatenate all input_ids and attention masks into one tensor when concatenate is True
+    if concatenate:
+        full_inputs["input_ids"] = [torch.cat(full_inputs["input_ids"], dim=0)]
+        full_inputs["attention_mask"] = [
+            torch.cat(full_inputs["attention_mask"], dim=0)
+        ]
 
-            buffer_input_ids = torch.cat((buffer_input_ids, ids), dim=0)
-            buffer_labels = torch.cat((buffer_labels, labels), dim=0)
-            buffer_attention_mask = torch.cat((buffer_attention_mask, mask), dim=0)
+    # Iterate through each sample and split into chunks of max_tokens
+    for sample_index in range(len(full_inputs["input_ids"])):
+        sample_len = len(full_inputs["input_ids"][sample_index])
 
-    if buffer_input_ids.numel() > 0:  # for any leftover tokens
-        while buffer_input_ids.numel() < max_tokens:  # make all sequences equal in size
-            buffer_input_ids = torch.cat(
-                (
-                    buffer_input_ids,
-                    torch.full(
-                        (max_tokens - buffer_input_ids.numel(),),
-                        tokenizer.pad_token_id,
-                        dtype=torch.long,
-                    ),
-                ),
-                dim=0,
-            )
-            buffer_labels = torch.cat(
-                (
-                    buffer_labels,
-                    torch.full(
-                        (max_tokens - buffer_labels.numel(),),
-                        -100,
-                        dtype=torch.long,
-                    ),
-                ),
-                dim=0,
-            )
-            buffer_attention_mask = torch.cat(
-                (
-                    buffer_attention_mask,
-                    torch.full(
-                        (max_tokens - buffer_attention_mask.numel(),),
-                        0,
-                        dtype=torch.long,
-                    ),
-                ),
-                dim=0,
-            )
-        new_input_ids.append(buffer_input_ids)
-        new_labels.append(buffer_labels)
-        new_attention_mask.append(buffer_attention_mask)
+        for text_index in range(0, sample_len, max_tokens):
+            # Create partial tensors for inputs, targets, and attention masks with fill values
+            partial_inputs_ids = torch.full((max_tokens,), pad_id, dtype=torch.long)
+            partial_target_ids = torch.full((max_tokens,), -100, dtype=torch.long)
+            partial_attention_mask = torch.zeros((max_tokens,), dtype=torch.long)
 
-    ret = {
-        "input_ids": [seq.tolist() for seq in new_input_ids],
-        "labels": [seq.tolist() for seq in new_labels],
-        "attention_mask": [seq.tolist() for seq in new_attention_mask],
+            # Determine the length of the text to copy
+            text_length = min(max_tokens, sample_len - text_index)
+
+            # Copy the text into the partial tensors
+            partial_inputs_ids[:text_length] = full_inputs["input_ids"][sample_index][
+                text_index : text_index + text_length
+            ]
+            partial_target_ids[:text_length] = full_inputs["input_ids"][sample_index][
+                text_index : text_index + text_length
+            ]
+            partial_attention_mask[:text_length] = full_inputs["attention_mask"][
+                sample_index
+            ][text_index : text_index + text_length]
+
+            # Append the partial tensors to the lists
+            inputs_ids.append(partial_inputs_ids)
+            target_ids.append(partial_target_ids)
+            attention_mask.append(partial_attention_mask)
+
+    LOG.debug("encode_streaming: created %d chunks", len(inputs_ids))
+
+    return {
+        "input_ids": [input_id.tolist() for input_id in inputs_ids],
+        "labels": [target_id.tolist() for target_id in target_ids],
+        "attention_mask": [mask.tolist() for mask in attention_mask],
     }
-
-    LOG.debug(len(ret["input_ids"]))
-    return ret
 
 
 def wrap_streaming_dataset(
@@ -204,6 +143,7 @@ def wrap_streaming_dataset(
             batch_size=cfg.micro_batch_size,
             multipack_attn=multipack_attn,
             bin_size=cfg.sample_packing_bin_size,
+            is_pretraining=bool(cfg.pretraining_dataset),
         )
 
         # Set this to 1 so downstream data_loader doesn't try to increase the batch size
@@ -251,6 +191,80 @@ def wrap_streaming_dataset(
     return dataset
 
 
+def _chunk_long_sequences(
+    train_dataset: Dataset,
+    max_seq_length: int,
+) -> Dataset:
+    """
+    Chunk sequences longer than max_seq_length into multiple smaller sequences.
+
+    Instead of dropping long sequences (which loses data), this function splits
+    them into max_seq_length-sized chunks. This is especially useful for pretraining
+    datasets with very long samples (e.g., millions of tokens per example).
+
+    Note: This should only be used for pretraining. For SFT, long sequences should
+    be dropped to maintain complete instruction-response pairs.
+
+    Args:
+        train_dataset: Dataset with input_ids, attention_mask, and optionally labels
+        max_seq_length: Maximum sequence length for each chunk
+
+    Returns:
+        Dataset with all sequences <= max_seq_length
+    """
+    columns = train_dataset.column_names
+    has_labels = "labels" in columns
+    has_attention_mask = "attention_mask" in columns
+
+    total_samples = len(train_dataset)
+    long_samples = sum(
+        1 for i in range(total_samples)
+        if len(train_dataset[i]["input_ids"]) > max_seq_length
+    )
+
+    if long_samples == 0:
+        return train_dataset
+
+    LOG.info(
+        "Chunking %d/%d sequences that exceed max_seq_length=%d",
+        long_samples,
+        total_samples,
+        max_seq_length,
+    )
+
+    new_data = defaultdict(list)
+    total_chunks = 0
+
+    for i in range(total_samples):
+        sample = train_dataset[i]
+        input_ids = sample["input_ids"]
+        seq_len = len(input_ids)
+
+        if seq_len <= max_seq_length:
+            new_data["input_ids"].append(input_ids)
+            if has_attention_mask:
+                new_data["attention_mask"].append(sample["attention_mask"])
+            if has_labels:
+                new_data["labels"].append(sample["labels"])
+            total_chunks += 1
+        else:
+            num_chunks = (seq_len + max_seq_length - 1) // max_seq_length
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * max_seq_length
+                end = min(start + max_seq_length, seq_len)
+
+                new_data["input_ids"].append(input_ids[start:end])
+                if has_attention_mask:
+                    new_data["attention_mask"].append(sample["attention_mask"][start:end])
+                if has_labels:
+                    new_data["labels"].append(sample["labels"][start:end])
+                total_chunks += 1
+
+    LOG.info("Chunking complete: %d samples -> %d chunks", total_samples, total_chunks)
+
+    return Dataset.from_dict(dict(new_data))
+
+
 def encode_packed_streaming(
     collate_fn,
     ds_wrapper: Callable,
@@ -259,17 +273,40 @@ def encode_packed_streaming(
     max_seq_length: int = 2048,
     batch_size: int = 4,
     multipack_attn: Optional[bool] = True,
+    is_pretraining: bool = False,
 ) -> Dict[str, List]:
-    # tokenize all the examples
-    # rows get split with stride (overlap)
+    """
+    Encode examples for sample packing with streaming support.
+
+    This function tokenizes examples, optionally chunks long sequences (for pretraining),
+    and then packs them together efficiently using MultipackBatchSampler.
+
+    For pretraining: long sequences are chunked to preserve data.
+    For SFT: long sequences are dropped to maintain complete instruction-response pairs.
+
+    Args:
+        collate_fn: Collator function for batching
+        ds_wrapper: Dataset wrapper function for tokenization
+        examples: Raw examples to process
+        bin_size: Bin size for multipack sampler
+        max_seq_length: Maximum sequence length
+        batch_size: Micro batch size
+        multipack_attn: Whether to use multipack attention
+        is_pretraining: If True, chunk long sequences; if False, let them be dropped
+    """
+    # Tokenize all the examples
     train_dataset = ds_wrapper(dataset=Dataset.from_dict(examples))[0]
 
+    # Only chunk long sequences for pretraining (preserves data)
+    # For SFT, we want to drop long sequences to keep complete examples
+    if is_pretraining:
+        train_dataset = _chunk_long_sequences(train_dataset, max_seq_length)
+
+    # Process for packing - sequences are now all <= max_seq_length
     train_dataset = process_pretraining_datasets_for_packing(
         train_dataset,
         max_seq_length,
         skip_position_ids=not multipack_attn,
-        # FIXME using attention mask unpad/pad with trainer and packed pretraining is broken atm
-        # workaround by using the position id logic for now in trainer
         drop_attention_mask=multipack_attn,
     )
 
