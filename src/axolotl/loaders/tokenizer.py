@@ -41,6 +41,7 @@ def modify_tokenizer_files(
         tokenizer_path: Path or name of the original tokenizer
         token_mappings: Dict mapping {token_id (int): new_token_string}
         output_dir: Directory to save the modified tokenizer
+        revision: Model revision/branch/tag/commit to load from (HF Hub)
 
     Returns:
         Path to the modified tokenizer directory
