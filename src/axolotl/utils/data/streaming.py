@@ -1,7 +1,6 @@
 """Data handling specific to streaming datasets."""
 
 import functools
-import sys
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional
 
@@ -18,24 +17,6 @@ from axolotl.utils.trainer import process_pretraining_datasets_for_packing
 LOG = get_logger(__name__)
 
 
-def _get_memory_mb(obj) -> float:
-    """Get approximate memory usage of an object in MB."""
-    if isinstance(obj, torch.Tensor):
-        return obj.element_size() * obj.nelement() / (1024 * 1024)
-    if isinstance(obj, list):
-        return sum(_get_memory_mb(item) for item in obj)
-    if isinstance(obj, dict):
-        return sum(_get_memory_mb(v) for v in obj.values())
-    return sys.getsizeof(obj) / (1024 * 1024)
-
-
-def _format_memory(mb: float) -> str:
-    """Format memory size for display."""
-    if mb >= 1024:
-        return f"{mb / 1024:.2f} GB"
-    return f"{mb:.2f} MB"
-
-
 def encode_streaming(
     examples: Dict[str, List],
     tokenizer: PreTrainedTokenizerBase,
@@ -44,11 +25,11 @@ def encode_streaming(
     concatenate: bool = True,
 ) -> Dict[str, List]:
     """
-    Encode streaming examples with auto-truncation support.
+    Encode streaming examples with auto-chunking support.
 
     This function tokenizes text without truncation, then automatically splits
     long sequences into max_tokens-sized chunks. This ensures no data is lost
-    from long sequences (from PR #3081: pretraining-auto-truncate).
+    from long sequences.
 
     Args:
         examples: Dictionary containing text samples
@@ -60,23 +41,13 @@ def encode_streaming(
     Returns:
         Dictionary with input_ids, labels, and attention_mask lists
     """
-    num_examples = len(examples[text_column])
-    LOG.info(
-        "encode_streaming: Processing %d examples (max_tokens=%d, concatenate=%s)",
-        num_examples,
-        max_tokens,
-        concatenate,
-    )
-
     # Tokenize without truncation to preserve all data
-    LOG.info("Tokenizing %d examples without truncation...", num_examples)
     full_inputs = tokenizer(
         examples[text_column],
         add_special_tokens=True,
     )
 
     # Convert input_ids and attention_mask to tensors
-    LOG.info("Converting tokenized outputs to tensors...")
     full_inputs["input_ids"] = [
         torch.tensor(sample, dtype=torch.long) for sample in full_inputs["input_ids"]
     ]
@@ -84,16 +55,6 @@ def encode_streaming(
         torch.tensor(sample, dtype=torch.long)
         for sample in full_inputs["attention_mask"]
     ]
-
-    # Calculate total tokens and memory usage after tokenization
-    total_tokens = sum(len(ids) for ids in full_inputs["input_ids"])
-    tokenized_mem = _get_memory_mb(full_inputs)
-    LOG.info(
-        "Tokenization complete: %d total tokens across %d samples, memory: %s",
-        total_tokens,
-        num_examples,
-        _format_memory(tokenized_mem),
-    )
 
     # Resolve a safe pad token id for chunk padding
     pad_id = (
@@ -111,46 +72,14 @@ def encode_streaming(
 
     # Concatenate all input_ids and attention masks into one tensor when concatenate is True
     if concatenate:
-        LOG.info(
-            "Concatenating %d samples into single tensor (%d tokens)...",
-            num_examples,
-            total_tokens,
-        )
         full_inputs["input_ids"] = [torch.cat(full_inputs["input_ids"], dim=0)]
         full_inputs["attention_mask"] = [
             torch.cat(full_inputs["attention_mask"], dim=0)
         ]
-        concat_mem = _get_memory_mb(full_inputs)
-        LOG.info(
-            "Concatenation complete: single tensor of %d tokens, memory: %s",
-            len(full_inputs["input_ids"][0]),
-            _format_memory(concat_mem),
-        )
-
-    # Estimate output memory requirement
-    num_chunks_estimate = (total_tokens + max_tokens - 1) // max_tokens
-    # Each chunk has input_ids, labels, attention_mask (3 tensors of max_tokens int64)
-    estimated_output_mem = num_chunks_estimate * 3 * max_tokens * 8 / (1024 * 1024)
-    LOG.info(
-        "Chunking into ~%d chunks of %d tokens each, estimated output memory: %s",
-        num_chunks_estimate,
-        max_tokens,
-        _format_memory(estimated_output_mem),
-    )
 
     # Iterate through each sample and split into chunks of max_tokens
-    LOG.info("Splitting sequences into max_tokens-sized chunks...")
     for sample_index in range(len(full_inputs["input_ids"])):
         sample_len = len(full_inputs["input_ids"][sample_index])
-        num_chunks_for_sample = (sample_len + max_tokens - 1) // max_tokens
-
-        if not concatenate and num_chunks_for_sample > 1:
-            LOG.debug(
-                "Sample %d: %d tokens -> %d chunks",
-                sample_index,
-                sample_len,
-                num_chunks_for_sample,
-            )
 
         for text_index in range(0, sample_len, max_tokens):
             # Create partial tensors for inputs, targets, and attention masks with fill values
@@ -177,30 +106,13 @@ def encode_streaming(
             target_ids.append(partial_target_ids)
             attention_mask.append(partial_attention_mask)
 
-    # Calculate final memory usage
-    final_mem = _get_memory_mb(inputs_ids) + _get_memory_mb(target_ids) + _get_memory_mb(attention_mask)
-    LOG.info(
-        "Chunking complete: %d chunks created, output tensors memory: %s",
-        len(inputs_ids),
-        _format_memory(final_mem),
-    )
+    LOG.debug("encode_streaming: created %d chunks", len(inputs_ids))
 
-    # Convert to lists for return
-    LOG.info("Converting %d chunks to lists for output...", len(inputs_ids))
-    result = {
+    return {
         "input_ids": [input_id.tolist() for input_id in inputs_ids],
         "labels": [target_id.tolist() for target_id in target_ids],
         "attention_mask": [mask.tolist() for mask in attention_mask],
     }
-
-    result_mem = _get_memory_mb(result)
-    LOG.info(
-        "encode_streaming complete: %d chunks, final output memory: %s",
-        len(result["input_ids"]),
-        _format_memory(result_mem),
-    )
-
-    return result
 
 
 def wrap_streaming_dataset(
@@ -296,12 +208,10 @@ def _chunk_long_sequences(
     Returns:
         Dataset with all sequences <= max_seq_length
     """
-    # Get column names to process
     columns = train_dataset.column_names
     has_labels = "labels" in columns
     has_attention_mask = "attention_mask" in columns
 
-    # Count sequences that need chunking
     total_samples = len(train_dataset)
     long_samples = sum(
         1 for i in range(total_samples)
@@ -309,39 +219,31 @@ def _chunk_long_sequences(
     )
 
     if long_samples == 0:
-        LOG.info("No sequences exceed max_seq_length=%d, skipping chunking", max_seq_length)
         return train_dataset
 
     LOG.info(
-        "Chunking %d/%d sequences that exceed max_seq_length=%d (instead of dropping)",
+        "Chunking %d/%d sequences that exceed max_seq_length=%d",
         long_samples,
         total_samples,
         max_seq_length,
     )
 
-    # Build new chunked data
     new_data = defaultdict(list)
     total_chunks = 0
-    total_tokens_before = 0
-    total_tokens_after = 0
 
     for i in range(total_samples):
         sample = train_dataset[i]
         input_ids = sample["input_ids"]
         seq_len = len(input_ids)
-        total_tokens_before += seq_len
 
         if seq_len <= max_seq_length:
-            # Keep as is
             new_data["input_ids"].append(input_ids)
             if has_attention_mask:
                 new_data["attention_mask"].append(sample["attention_mask"])
             if has_labels:
                 new_data["labels"].append(sample["labels"])
             total_chunks += 1
-            total_tokens_after += seq_len
         else:
-            # Chunk into max_seq_length pieces
             num_chunks = (seq_len + max_seq_length - 1) // max_seq_length
             for chunk_idx in range(num_chunks):
                 start = chunk_idx * max_seq_length
@@ -352,19 +254,10 @@ def _chunk_long_sequences(
                     new_data["attention_mask"].append(sample["attention_mask"][start:end])
                 if has_labels:
                     new_data["labels"].append(sample["labels"][start:end])
-
                 total_chunks += 1
-                total_tokens_after += (end - start)
 
-    LOG.info(
-        "Chunking complete: %d samples -> %d chunks, %d tokens preserved (was %d)",
-        total_samples,
-        total_chunks,
-        total_tokens_after,
-        total_tokens_before,
-    )
+    LOG.info("Chunking complete: %d samples -> %d chunks", total_samples, total_chunks)
 
-    # Create new dataset from chunked data
     return Dataset.from_dict(dict(new_data))
 
 
@@ -383,33 +276,20 @@ def encode_packed_streaming(
     This function tokenizes examples, chunks any long sequences (instead of dropping),
     and then packs them together efficiently using MultipackBatchSampler.
     """
-    LOG.info(
-        "encode_packed_streaming: Processing %d examples (max_seq_length=%d)",
-        len(examples.get("text", examples.get("input_ids", []))),
-        max_seq_length,
-    )
-
-    # tokenize all the examples
-    # rows get split with stride (overlap)
-    LOG.info("Tokenizing examples via ds_wrapper...")
+    # Tokenize all the examples
     train_dataset = ds_wrapper(dataset=Dataset.from_dict(examples))[0]
-    LOG.info("Tokenization complete: %d sequences", len(train_dataset))
 
     # Chunk long sequences instead of dropping them
-    # This preserves all data from very long samples
     train_dataset = _chunk_long_sequences(train_dataset, max_seq_length)
 
-    # Now process for packing - this will no longer drop sequences since they're all chunked
+    # Process for packing - sequences are now all <= max_seq_length
     train_dataset = process_pretraining_datasets_for_packing(
         train_dataset,
         max_seq_length,
         skip_position_ids=not multipack_attn,
-        # FIXME using attention mask unpad/pad with trainer and packed pretraining is broken atm
-        # workaround by using the position id logic for now in trainer
         drop_attention_mask=multipack_attn,
     )
 
-    LOG.info("Creating MultipackBatchSampler for %d sequences...", len(train_dataset))
     sampler = MultipackBatchSampler(
         sampler=RandomSampler(train_dataset),
         lengths=get_dataset_lengths(train_dataset),
@@ -421,10 +301,8 @@ def encode_packed_streaming(
     )
 
     chunked_data = defaultdict(list)
-    num_batches = 0
 
     for batch in sampler:
-        num_batches += 1
         for data in batch:
             features = train_dataset[data]
             if "num_truncated_tokens" in features:
@@ -439,11 +317,5 @@ def encode_packed_streaming(
                 if feature == "length":
                     continue
                 chunked_data[feature].append(collated_features[feature].squeeze(0))
-
-    LOG.info(
-        "encode_packed_streaming complete: %d batches, %d packed sequences",
-        num_batches,
-        len(chunked_data.get("input_ids", [])),
-    )
 
     return chunked_data
