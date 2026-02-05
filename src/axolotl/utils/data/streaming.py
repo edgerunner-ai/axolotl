@@ -143,6 +143,7 @@ def wrap_streaming_dataset(
             batch_size=cfg.micro_batch_size,
             multipack_attn=multipack_attn,
             bin_size=cfg.sample_packing_bin_size,
+            is_pretraining=bool(cfg.pretraining_dataset),
         )
 
         # Set this to 1 so downstream data_loader doesn't try to increase the batch size
@@ -198,8 +199,11 @@ def _chunk_long_sequences(
     Chunk sequences longer than max_seq_length into multiple smaller sequences.
 
     Instead of dropping long sequences (which loses data), this function splits
-    them into max_seq_length-sized chunks. This is especially useful for datasets
-    with very long samples (e.g., millions of tokens per example).
+    them into max_seq_length-sized chunks. This is especially useful for pretraining
+    datasets with very long samples (e.g., millions of tokens per example).
+
+    Note: This should only be used for pretraining. For SFT, long sequences should
+    be dropped to maintain complete instruction-response pairs.
 
     Args:
         train_dataset: Dataset with input_ids, attention_mask, and optionally labels
@@ -269,18 +273,34 @@ def encode_packed_streaming(
     max_seq_length: int = 2048,
     batch_size: int = 4,
     multipack_attn: Optional[bool] = True,
+    is_pretraining: bool = False,
 ) -> Dict[str, List]:
     """
     Encode examples for sample packing with streaming support.
 
-    This function tokenizes examples, chunks any long sequences (instead of dropping),
+    This function tokenizes examples, optionally chunks long sequences (for pretraining),
     and then packs them together efficiently using MultipackBatchSampler.
+
+    For pretraining: long sequences are chunked to preserve data.
+    For SFT: long sequences are dropped to maintain complete instruction-response pairs.
+
+    Args:
+        collate_fn: Collator function for batching
+        ds_wrapper: Dataset wrapper function for tokenization
+        examples: Raw examples to process
+        bin_size: Bin size for multipack sampler
+        max_seq_length: Maximum sequence length
+        batch_size: Micro batch size
+        multipack_attn: Whether to use multipack attention
+        is_pretraining: If True, chunk long sequences; if False, let them be dropped
     """
     # Tokenize all the examples
     train_dataset = ds_wrapper(dataset=Dataset.from_dict(examples))[0]
 
-    # Chunk long sequences instead of dropping them
-    train_dataset = _chunk_long_sequences(train_dataset, max_seq_length)
+    # Only chunk long sequences for pretraining (preserves data)
+    # For SFT, we want to drop long sequences to keep complete examples
+    if is_pretraining:
+        train_dataset = _chunk_long_sequences(train_dataset, max_seq_length)
 
     # Process for packing - sequences are now all <= max_seq_length
     train_dataset = process_pretraining_datasets_for_packing(
