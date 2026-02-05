@@ -135,8 +135,10 @@ def load_tokenizer(cfg: DictDefault) -> PreTrainedTokenizer:
         from axolotl.utils.mistral import HFMistralTokenizer
 
         # Load the HF-compatible wrapper around MistralTokenizer
-        revision = cfg.revision_of_model or "main"
-        tokenizer = HFMistralTokenizer.from_pretrained(cfg.tokenizer_config, revision=revision)
+        kwargs = {}
+        if cfg.revision_of_model:
+            kwargs["revision"] = cfg.revision_of_model
+        tokenizer = HFMistralTokenizer.from_pretrained(cfg.tokenizer_config, **kwargs)
 
         return tokenizer
 
