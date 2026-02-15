@@ -27,9 +27,18 @@ def encode_streaming(
     """
     Encode streaming examples with auto-chunking support.
 
-    This function tokenizes text without truncation, then automatically splits
-    long sequences into max_tokens-sized chunks. This ensures no data is lost
-    from long sequences.
+    Tokenizes text without truncation, appends EOS/PAD document boundary tokens,
+    then splits into max_tokens-sized chunks. This ensures no data is lost from
+    long sequences while preserving document boundaries for pretraining.
+
+    Note: When concatenate=False, individual samples that exceed max_tokens will
+    be split into multiple chunks (rather than truncated), so the output may have
+    more rows than the input.
+
+    Note: Tokenization is performed without truncation so that long documents can
+    be chunked rather than silently lost. The streaming buffer size
+    (streaming_multipack_buffer_size) controls how many examples are batched at
+    once, limiting peak memory usage.
 
     Args:
         examples: Dictionary containing text samples
@@ -47,14 +56,82 @@ def encode_streaming(
         add_special_tokens=True,
     )
 
-    # Convert input_ids and attention_mask to tensors
-    full_inputs["input_ids"] = [
+    # Convert to PyTorch tensors
+    input_ids = [
         torch.tensor(sample, dtype=torch.long) for sample in full_inputs["input_ids"]
     ]
-    full_inputs["attention_mask"] = [
+    targets = [
+        torch.tensor(sample, dtype=torch.long) for sample in full_inputs["input_ids"]
+    ]
+    attention_mask = [
         torch.tensor(sample, dtype=torch.long)
         for sample in full_inputs["attention_mask"]
     ]
+
+    if not concatenate:
+        # Without concatenation, chunk each sample independently into max_tokens pieces
+        pad_id = (
+            tokenizer.pad_token_id
+            if tokenizer.pad_token_id is not None
+            else (tokenizer.eos_token_id or 0)
+        )
+        new_input_ids = []
+        new_labels = []
+        new_attention_mask = []
+
+        for ids, tgts, mask in zip(input_ids, targets, attention_mask, strict=False):
+            sample_len = ids.numel()
+            for start in range(0, sample_len, max_tokens):
+                end = min(start + max_tokens, sample_len)
+                chunk_len = end - start
+
+                chunk_ids = torch.full((max_tokens,), pad_id, dtype=torch.long)
+                chunk_labels = torch.full((max_tokens,), -100, dtype=torch.long)
+                chunk_mask = torch.zeros((max_tokens,), dtype=torch.long)
+
+                chunk_ids[:chunk_len] = ids[start:end]
+                chunk_labels[:chunk_len] = tgts[start:end]
+                chunk_mask[:chunk_len] = mask[start:end]
+
+                new_input_ids.append(chunk_ids)
+                new_labels.append(chunk_labels)
+                new_attention_mask.append(chunk_mask)
+
+        LOG.debug("encode_streaming (no concat): created %d chunks", len(new_input_ids))
+        return {
+            "input_ids": [seq.tolist() for seq in new_input_ids],
+            "labels": [seq.tolist() for seq in new_labels],
+            "attention_mask": [seq.tolist() for seq in new_attention_mask],
+        }
+
+    # --- concatenate=True path ---
+
+    # Append EOS and PAD tokens to mark document boundaries (before concatenation)
+    for i, _ in enumerate(input_ids):
+        input_ids[i] = torch.cat(
+            (
+                input_ids[i],
+                torch.tensor([tokenizer.eos_token_id, tokenizer.pad_token_id]),
+            ),
+            dim=0,
+        )
+        targets[i] = torch.cat(
+            (
+                targets[i],
+                torch.tensor([tokenizer.eos_token_id, -100]),
+            ),
+            dim=0,
+        )
+        attention_mask[i] = torch.cat(
+            (attention_mask[i], torch.tensor([1, 0])), dim=0
+        )
+
+    # Concatenate all samples into a single stream
+    all_input_ids = torch.cat(input_ids, dim=0)
+    all_targets = torch.cat(targets, dim=0)
+    all_attention_mask = torch.cat(attention_mask, dim=0)
+
+    total_len = all_input_ids.numel()
 
     # Resolve a safe pad token id for chunk padding
     pad_id = (
@@ -68,50 +145,33 @@ def encode_streaming(
             "tokenizer.pad_token_id is None; falling back to %s for padding", pad_id
         )
 
-    inputs_ids, target_ids, attention_mask = [], [], []
+    new_input_ids = []
+    new_labels = []
+    new_attention_mask = []
 
-    # Concatenate all input_ids and attention masks into one tensor when concatenate is True
-    if concatenate:
-        full_inputs["input_ids"] = [torch.cat(full_inputs["input_ids"], dim=0)]
-        full_inputs["attention_mask"] = [
-            torch.cat(full_inputs["attention_mask"], dim=0)
-        ]
+    # Split the concatenated stream into max_tokens-sized chunks
+    for start in range(0, total_len, max_tokens):
+        end = min(start + max_tokens, total_len)
+        chunk_len = end - start
 
-    # Iterate through each sample and split into chunks of max_tokens
-    for sample_index in range(len(full_inputs["input_ids"])):
-        sample_len = len(full_inputs["input_ids"][sample_index])
+        chunk_ids = torch.full((max_tokens,), pad_id, dtype=torch.long)
+        chunk_labels = torch.full((max_tokens,), -100, dtype=torch.long)
+        chunk_mask = torch.zeros((max_tokens,), dtype=torch.long)
 
-        for text_index in range(0, sample_len, max_tokens):
-            # Create partial tensors for inputs, targets, and attention masks with fill values
-            partial_inputs_ids = torch.full((max_tokens,), pad_id, dtype=torch.long)
-            partial_target_ids = torch.full((max_tokens,), -100, dtype=torch.long)
-            partial_attention_mask = torch.zeros((max_tokens,), dtype=torch.long)
+        chunk_ids[:chunk_len] = all_input_ids[start:end]
+        chunk_labels[:chunk_len] = all_targets[start:end]
+        chunk_mask[:chunk_len] = all_attention_mask[start:end]
 
-            # Determine the length of the text to copy
-            text_length = min(max_tokens, sample_len - text_index)
+        new_input_ids.append(chunk_ids)
+        new_labels.append(chunk_labels)
+        new_attention_mask.append(chunk_mask)
 
-            # Copy the text into the partial tensors
-            partial_inputs_ids[:text_length] = full_inputs["input_ids"][sample_index][
-                text_index : text_index + text_length
-            ]
-            partial_target_ids[:text_length] = full_inputs["input_ids"][sample_index][
-                text_index : text_index + text_length
-            ]
-            partial_attention_mask[:text_length] = full_inputs["attention_mask"][
-                sample_index
-            ][text_index : text_index + text_length]
-
-            # Append the partial tensors to the lists
-            inputs_ids.append(partial_inputs_ids)
-            target_ids.append(partial_target_ids)
-            attention_mask.append(partial_attention_mask)
-
-    LOG.debug("encode_streaming: created %d chunks", len(inputs_ids))
+    LOG.debug("encode_streaming: created %d chunks", len(new_input_ids))
 
     return {
-        "input_ids": [input_id.tolist() for input_id in inputs_ids],
-        "labels": [target_id.tolist() for target_id in target_ids],
-        "attention_mask": [mask.tolist() for mask in attention_mask],
+        "input_ids": [seq.tolist() for seq in new_input_ids],
+        "labels": [seq.tolist() for seq in new_labels],
+        "attention_mask": [seq.tolist() for seq in new_attention_mask],
     }
 
 
@@ -121,6 +181,7 @@ def wrap_streaming_dataset(
     cfg,
     ds_wrapper_fn,
 ):
+    """Wrap a streaming dataset with encoding/packing logic."""
     if cfg.sample_packing:
         # For SFT (non-pretraining) datasets, always use multipack_attn=True to ensure
         # attention isolation between packed sequences
@@ -205,6 +266,10 @@ def _chunk_long_sequences(
     Note: This should only be used for pretraining. For SFT, long sequences should
     be dropped to maintain complete instruction-response pairs.
 
+    Note: The last chunk of a split sequence may be shorter than max_seq_length.
+    This is intentional to preserve all data; the downstream packer handles
+    variable-length sequences.
+
     Args:
         train_dataset: Dataset with input_ids, attention_mask, and optionally labels
         max_seq_length: Maximum sequence length for each chunk
@@ -216,38 +281,30 @@ def _chunk_long_sequences(
     has_labels = "labels" in columns
     has_attention_mask = "attention_mask" in columns
 
-    total_samples = len(train_dataset)
-    long_samples = sum(
-        1 for i in range(total_samples)
-        if len(train_dataset[i]["input_ids"]) > max_seq_length
-    )
+    # Use batch column access for performance (avoids per-element __getitem__)
+    all_input_ids = train_dataset["input_ids"]
+    all_attention_mask = train_dataset["attention_mask"] if has_attention_mask else None
+    all_labels = train_dataset["labels"] if has_labels else None
 
-    if long_samples == 0:
-        return train_dataset
-
-    LOG.info(
-        "Chunking %d/%d sequences that exceed max_seq_length=%d",
-        long_samples,
-        total_samples,
-        max_seq_length,
-    )
+    total_samples = len(all_input_ids)
 
     new_data = defaultdict(list)
     total_chunks = 0
+    long_samples = 0
 
     for i in range(total_samples):
-        sample = train_dataset[i]
-        input_ids = sample["input_ids"]
+        input_ids = all_input_ids[i]
         seq_len = len(input_ids)
 
         if seq_len <= max_seq_length:
             new_data["input_ids"].append(input_ids)
             if has_attention_mask:
-                new_data["attention_mask"].append(sample["attention_mask"])
+                new_data["attention_mask"].append(all_attention_mask[i])
             if has_labels:
-                new_data["labels"].append(sample["labels"])
+                new_data["labels"].append(all_labels[i])
             total_chunks += 1
         else:
+            long_samples += 1
             num_chunks = (seq_len + max_seq_length - 1) // max_seq_length
             for chunk_idx in range(num_chunks):
                 start = chunk_idx * max_seq_length
@@ -255,12 +312,22 @@ def _chunk_long_sequences(
 
                 new_data["input_ids"].append(input_ids[start:end])
                 if has_attention_mask:
-                    new_data["attention_mask"].append(sample["attention_mask"][start:end])
+                    new_data["attention_mask"].append(all_attention_mask[i][start:end])
                 if has_labels:
-                    new_data["labels"].append(sample["labels"][start:end])
+                    new_data["labels"].append(all_labels[i][start:end])
                 total_chunks += 1
 
-    LOG.info("Chunking complete: %d samples -> %d chunks", total_samples, total_chunks)
+    if long_samples == 0:
+        return train_dataset
+
+    LOG.info(
+        "Chunked %d/%d sequences exceeding max_seq_length=%d: %d samples -> %d chunks",
+        long_samples,
+        total_samples,
+        max_seq_length,
+        total_samples,
+        total_chunks,
+    )
 
     return Dataset.from_dict(dict(new_data))
 
