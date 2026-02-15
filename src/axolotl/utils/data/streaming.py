@@ -122,9 +122,7 @@ def encode_streaming(
             ),
             dim=0,
         )
-        attention_mask[i] = torch.cat(
-            (attention_mask[i], torch.tensor([1, 0])), dim=0
-        )
+        attention_mask[i] = torch.cat((attention_mask[i], torch.tensor([1, 0])), dim=0)
 
     # Concatenate all samples into a single stream
     all_input_ids = torch.cat(input_ids, dim=0)
