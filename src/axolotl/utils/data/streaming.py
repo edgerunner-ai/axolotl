@@ -280,9 +280,11 @@ def _chunk_long_sequences(
     has_attention_mask = "attention_mask" in columns
 
     # Use batch column access for performance (avoids per-element __getitem__)
-    all_input_ids = train_dataset["input_ids"]
-    all_attention_mask = train_dataset["attention_mask"] if has_attention_mask else None
-    all_labels = train_dataset["labels"] if has_labels else None
+    all_input_ids: list = train_dataset["input_ids"]
+    all_attention_mask: list = (
+        train_dataset["attention_mask"] if has_attention_mask else []
+    )
+    all_labels: list = train_dataset["labels"] if has_labels else []
 
     total_samples = len(all_input_ids)
 
