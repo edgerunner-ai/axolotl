@@ -1245,7 +1245,11 @@ class PretrainingValidationMixin:
     def check_streaming_w_dataset_weight(cls, data):
         if data.get("streaming") and data.get("datasets"):
             for ds_cfg in data["datasets"]:
-                weight = ds_cfg.get("weight") if isinstance(ds_cfg, dict) else getattr(ds_cfg, "weight", None)
+                weight = (
+                    ds_cfg.get("weight")
+                    if isinstance(ds_cfg, dict)
+                    else getattr(ds_cfg, "weight", None)
+                )
                 if weight is not None and weight < 1.0:
                     LOG.warning(
                         "Dataset weight is not supported with streaming datasets and will be ignored. "

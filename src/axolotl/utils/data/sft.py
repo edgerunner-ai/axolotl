@@ -414,12 +414,21 @@ def _load_and_process_single_dataset(
         and not streaming
     ):
         original_len = len(dataset)
-        num_samples = max(1, int(original_len * dataset_config.weight))
-        dataset = dataset.shuffle(seed=seed).select(range(num_samples))
-        LOG.info(
-            f"Applied weight={dataset_config.weight} to dataset "
-            f"'{dataset_config.path}': {original_len} -> {num_samples} samples"
-        )
+        if original_len == 0:
+            LOG.warning(
+                f"Skipping weight subsampling for dataset "
+                f"'{dataset_config.path}' because it is empty."
+            )
+        else:
+            num_samples = min(
+                original_len,
+                max(1, int(original_len * dataset_config.weight)),
+            )
+            dataset = dataset.shuffle(seed=seed).select(range(num_samples))
+            LOG.info(
+                f"Applied weight={dataset_config.weight} to dataset "
+                f"'{dataset_config.path}': {original_len} -> {num_samples} samples"
+            )
 
     # Apply dataset wrapper
     dataset_wrapper, dataset_prompter = get_dataset_wrapper(
