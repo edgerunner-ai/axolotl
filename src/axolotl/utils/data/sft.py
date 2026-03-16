@@ -407,6 +407,20 @@ def _load_and_process_single_dataset(
             num_shards=dataset_config.shards, index=shards_idx
         )
 
+    # Apply weight-based subsampling before tokenization to save compute
+    if (
+        dataset_config.weight is not None
+        and dataset_config.weight < 1.0
+        and not streaming
+    ):
+        original_len = len(dataset)
+        num_samples = max(1, int(original_len * dataset_config.weight))
+        dataset = dataset.shuffle(seed=seed).select(range(num_samples))
+        LOG.info(
+            f"Applied weight={dataset_config.weight} to dataset "
+            f"'{dataset_config.path}': {original_len} -> {num_samples} samples"
+        )
+
     # Apply dataset wrapper
     dataset_wrapper, dataset_prompter = get_dataset_wrapper(
         dataset_config=dataset_config,
