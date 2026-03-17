@@ -87,7 +87,9 @@ class ModelInputConfig(BaseModel):
         json_schema_extra={"description": "Use custom kernels, e.g. MegaBlocks."},
     )
 
-    model_quantization_config: Literal["Mxfp4Config"] | None = Field(
+    model_quantization_config: (
+        Literal["Mxfp4Config", "FineGrainedFP8Config"] | None
+    ) = Field(
         default=None,
         json_schema_extra={"description": "Model loading quantization config"},
     )
